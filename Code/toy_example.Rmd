@@ -30,41 +30,59 @@ This is a toy example using two random protein sequences. The goal is to digest 
 # Functions to simulate mass spec proteomics
 digest_proteins = function(sequence, enzyme = "trypsin") Digest(sequence, enzyme = enzyme)$peptide
 
-digest_n_proteins = function(sequence, n, noise_fn, enzyme = "trypsin"){
-  peptide_counts = table(digest_proteins(sequence, enzyme = enzyme)) * n
+digest_n_proteins = function(sequence, n, noise_fn, enzyme = "trypsin", coefs = NULL){
+  digest_results = digest_proteins(sequence, enzyme = enzyme)
+  if(is.null(coefs)) coefs = data.frame(Peptide = unique(digest_results), 
+                                        Scale_Factor = rep(1, length(unique(digest_results))))
+  peptide_counts = table(digest_results) * n
   peptide_counts_adj = noise_fn(peptide_counts)
-  return(data.frame(Count = c(peptide_counts_adj), Peptide = names(peptide_counts)))
+  out_df = data.frame(Count = c(peptide_counts_adj), Peptide = names(peptide_counts))
+  out_df = out_df %>% 
+    left_join(., coefs) %>%
+    mutate(Count = Count * Scale_Factor) %>%
+    select(-Scale_Factor)
+  
+  return(out_df)
 } 
 
-digest_sequences = function(sequences, mean_abundances, noise_fn, enzyme = "trypsin"){
+digest_sequences = function(sequences, mean_abundances, noise_fn, enzyme = "trypsin", coefs = NULL){
   digest_results = c()
   for(i in seq_along(sequences)){
     if(i %% 100 == 0) cat("Sequence ", i, " out of ", length(sequences), '\r')
     sequence = sequences[i]
     mean_abundance = mean_abundances[i]
+    if(!is.null(coefs)) {
+        tmp_coefs = coef_df %>% filter(Protein == sequence) %>% select(-Protein)
+    } else {
+        tmp_coefs = coefs
+    }
+    
     digest_results = rbind(digest_results, 
                            digest_n_proteins(sequence, 
                                              mean_abundance, 
                                              enzyme = enzyme, 
-                                             noise_fn = noise_fn))
+                                             noise_fn = noise_fn,
+                                             coefs = tmp_coefs))
     digest_results = digest_results %>% group_by(Peptide) %>% summarise(Count = sum(Count)) %>% ungroup
   }
   return(digest_results)
 }
 
-generate_n_samples = function(sequences, mean_abundances, n_samples, noise_fn, samp_id_base = NULL, enzyme = "trypsin"){
+generate_n_samples = function(sequences, mean_abundances, n_samples, noise_fn, samp_id_base = NULL, enzyme = "trypsin", coefs = NULL){
   for(samp in seq_len(n_samples)){
     if(samp == 1) {
       peptide_abundances = digest_sequences(sequences, 
                                             mean_abundances, 
                                             noise_fn, 
-                                            enzyme = enzyme)
+                                            enzyme = enzyme,
+                                            coefs = coefs)
     } else {
       peptide_abundances = full_join(peptide_abundances, 
                                      digest_sequences(sequences, 
                                                       mean_abundances, 
                                                       noise_fn, 
-                                                      enzyme = enzyme), 
+                                                      enzyme = enzyme,
+                                                      coefs = coefs), 
                                      by = 'Peptide')
     }
   }
@@ -208,13 +226,191 @@ ggplot(ggdat, aes(x = Method, y = SEL, color = Combine_Function)) +
 
 
 
+### Adding Linear Component
+
+#### Peptide level linear transformation
+
+Create peptide coefficients for each unique peptide
+```{r}
+unique_peps = unique(X$Peptide)
+
+set.seed(1)
+coefs = rnorm(length(unique_peps), 0, 0.1)
+
+coef_df = data.frame(Peptide = unique_peps, Coefs = coefs, Mult_Factor = exp(coefs))
+```
+
+Combine with data simulated above
+```{r}
+X_new = X %>% 
+  left_join(., coef_df %>% select(Peptide, Mult_Factor), by = 'Peptide') %>%
+  mutate(across(starts_with("Samp"), ~ . * Mult_Factor)) %>%
+  select(-Mult_Factor)
+
+head(X_new, 20)
+```
 
 
 
+#### Preprocess using pmartR    
+- Log2 transform    
+- Median centering    
+
+```{r}
+# Generate peptide data
+pep_e_data = X_new
+pep_f_data = data.frame(Samp = names(pep_e_data)[names(pep_e_data) != "Peptide"], group = rep(c("1", "2"), each = n))
+pep_e_meta = get_peptide_mapping(sequences)
+
+# Make into pmart object
+pepdat = pmartR::as.pepData(e_data = pep_e_data,
+                            f_data = pep_f_data,
+                            e_meta = pep_e_meta,
+                            edata_cname = "Peptide",
+                            emeta_cname = "Protein",
+                            fdata_cname = "Samp")
+
+# Standard transformation and median centering
+pepdat = pmartR::edata_transform(pepdat, "log2")
+pepdat = pmartR::normalize_global(pepdat, subset_fn = 'all', norm_fn = "median", apply_norm = T, backtransform = F)
+pepdat = pmartR::applyFilt(pmartR::molecule_filter(pepdat), pepdat, min_num = 2)
+pepdat = pmartR::group_designation(pepdat, main_effects = 'group')
+```
+
+#### Perform rollup
+```{r}
+# Rollup
+methods = c('rollup', 'rrollup', 'zrollup')
+combine_fns = c("mean", "median")
+combinations = expand.grid(method = methods, combine_fn = combine_fns)
+out_dat = c()
+for(i in seq_len(nrow(combinations))){
+  method = combinations$method[i]
+  combine_fn = combinations$combine_fn[i]
+  single_pep = method == "zrollup"
+  
+  protdat = pmartR::protein_quant(pepdat, method, combine_fn = combine_fn, single_pep = single_pep)
+  tmp_res = imd_anova(protdat, test_method = 'anova')
+  res = data.frame(tmp_res %>% 
+                           select(Protein, starts_with("Fold_change")) %>%
+                           left_join(., expected_FC, by = 'Protein'), 
+                   Method = method, 
+                   Combine_Function = combine_fn)
+  
+  out_dat = rbind(out_dat, res)
+}
+out_dat = as_tibble(out_dat)
+```
+
+#### Compare across rollup methods
+```{r}
+ggdat = out_dat %>% mutate(SEL = (Fold_change_1_vs_2 - Expected_FC)^2)
+ggplot(ggdat, aes(x = Method, y = SEL, color = Combine_Function)) + 
+  geom_boxplot() + 
+  ylab("Squared Error Loss of log2FC Recovery") + 
+  labs(color = 'Combine Function') + 
+  theme_bw()
+```
 
 
+#### Within Protein- Peptide level linear transformation
+
+Create peptide coefficients for each unique peptide
+```{r}
+peptide_mapping = get_peptide_mapping(sequences)
+
+set.seed(1)
+coefs = rnorm(nrow(peptide_mapping), 0, 0.1)
+
+coef_df = peptide_mapping %>% mutate(Scale_Factor = exp(coefs))
+```
+
+```{r}
+
+n = 5
+
+X1 = generate_n_samples(sequences = sequences, 
+                        mean_abundances = G1_mean_abundances, 
+                        coefs = coef_df,
+                        n_samples = n, 
+                        noise_fn = function(peptide_counts) peptide_counts, 
+                        samp_id_base = NULL, 
+                        enzyme = "trypsin")
 
 
+X2 = generate_n_samples(sequences = sequences, 
+                        mean_abundances = G2_mean_abundances, 
+                        coefs = coef_df,
+                        n_samples = n, 
+                        noise_fn = function(peptide_counts) peptide_counts, 
+                        samp_id_base = NULL, 
+                        enzyme = "trypsin")
+
+X = full_join(X1, X2, by = 'Peptide')
+
+head(X, 20)
+```
+
+
+#### Preprocess using pmartR    
+- Log2 transform    
+- Median centering    
+
+```{r}
+# Generate peptide data
+pep_e_data = X_new
+pep_f_data = data.frame(Samp = names(pep_e_data)[names(pep_e_data) != "Peptide"], group = rep(c("1", "2"), each = n))
+pep_e_meta = get_peptide_mapping(sequences)
+
+# Make into pmart object
+pepdat = pmartR::as.pepData(e_data = pep_e_data,
+                            f_data = pep_f_data,
+                            e_meta = pep_e_meta,
+                            edata_cname = "Peptide",
+                            emeta_cname = "Protein",
+                            fdata_cname = "Samp")
+
+# Standard transformation and median centering
+pepdat = pmartR::edata_transform(pepdat, "log2")
+pepdat = pmartR::normalize_global(pepdat, subset_fn = 'all', norm_fn = "median", apply_norm = T, backtransform = F)
+pepdat = pmartR::applyFilt(pmartR::molecule_filter(pepdat), pepdat, min_num = 2)
+pepdat = pmartR::group_designation(pepdat, main_effects = 'group')
+```
+
+#### Perform rollup
+```{r}
+# Rollup
+methods = c('rollup', 'rrollup', 'zrollup')
+combine_fns = c("mean", "median")
+combinations = expand.grid(method = methods, combine_fn = combine_fns)
+out_dat = c()
+for(i in seq_len(nrow(combinations))){
+  method = combinations$method[i]
+  combine_fn = combinations$combine_fn[i]
+  single_pep = method == "zrollup"
+  
+  protdat = pmartR::protein_quant(pepdat, method, combine_fn = combine_fn, single_pep = single_pep)
+  tmp_res = imd_anova(protdat, test_method = 'anova')
+  res = data.frame(tmp_res %>% 
+                           select(Protein, starts_with("Fold_change")) %>%
+                           left_join(., expected_FC, by = 'Protein'), 
+                   Method = method, 
+                   Combine_Function = combine_fn)
+  
+  out_dat = rbind(out_dat, res)
+}
+out_dat = as_tibble(out_dat)
+```
+
+#### Compare across rollup methods
+```{r}
+ggdat = out_dat %>% mutate(SEL = (Fold_change_1_vs_2 - Expected_FC)^2)
+ggplot(ggdat, aes(x = Method, y = SEL, color = Combine_Function)) + 
+  geom_boxplot() + 
+  ylab("Squared Error Loss of log2FC Recovery") + 
+  labs(color = 'Combine Function') + 
+  theme_bw()
+```
 
 
 
