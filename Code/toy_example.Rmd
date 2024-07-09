@@ -1,0 +1,221 @@
+---
+title: "Toy Example"
+author: "Erik VonKaenel"
+output: 
+  html_document:
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+library(OrgMassSpecR)
+library(foreach)
+library(pmartR)
+library(seqinr)
+library(tidyverse)
+```
+
+### Description
+
+This is a toy example using two random protein sequences. The goal is to digest some amount of proteins for each group and then test how well each rollup method can recover the true log2 fold change without inducing any noise or additional variability.
+
+#### Helper Functions
+
+```{r}
+# Functions to simulate mass spec proteomics
+digest_proteins = function(sequence, enzyme = "trypsin") Digest(sequence, enzyme = enzyme)$peptide
+
+digest_n_proteins = function(sequence, n, noise_fn, enzyme = "trypsin"){
+  peptide_counts = table(digest_proteins(sequence, enzyme = enzyme)) * n
+  peptide_counts_adj = noise_fn(peptide_counts)
+  return(data.frame(Count = c(peptide_counts_adj), Peptide = names(peptide_counts)))
+} 
+
+digest_sequences = function(sequences, mean_abundances, noise_fn, enzyme = "trypsin"){
+  digest_results = c()
+  for(i in seq_along(sequences)){
+    if(i %% 100 == 0) cat("Sequence ", i, " out of ", length(sequences), '\r')
+    sequence = sequences[i]
+    mean_abundance = mean_abundances[i]
+    digest_results = rbind(digest_results, 
+                           digest_n_proteins(sequence, 
+                                             mean_abundance, 
+                                             enzyme = enzyme, 
+                                             noise_fn = noise_fn))
+    digest_results = digest_results %>% group_by(Peptide) %>% summarise(Count = sum(Count)) %>% ungroup
+  }
+  return(digest_results)
+}
+
+generate_n_samples = function(sequences, mean_abundances, n_samples, noise_fn, samp_id_base = NULL, enzyme = "trypsin"){
+  for(samp in seq_len(n_samples)){
+    if(samp == 1) {
+      peptide_abundances = digest_sequences(sequences, 
+                                            mean_abundances, 
+                                            noise_fn, 
+                                            enzyme = enzyme)
+    } else {
+      peptide_abundances = full_join(peptide_abundances, 
+                                     digest_sequences(sequences, 
+                                                      mean_abundances, 
+                                                      noise_fn, 
+                                                      enzyme = enzyme), 
+                                     by = 'Peptide')
+    }
+  }
+  if(!is.null(samp_id_base)){
+    names(peptide_abundances)[which(names(peptide_abundances) != 'Peptide')] = paste0(samp_id_base, seq_len(n_samples))
+  } else {
+    names(peptide_abundances)[which(names(peptide_abundances) != 'Peptide')] = paste0("Samp_", seq_len(n_samples))
+  }
+  return(peptide_abundances)
+}
+
+get_peptide_mapping = function(sequences){
+  peptide_mapping = c()
+  for(i in seq_along(sequences)){
+    sequence = sequences[i]
+    digest_results = digest_proteins(sequence)
+    peptide_mapping = rbind(peptide_mapping, 
+                            cbind(Peptide = unique(digest_results), Protein = sequences[i]))
+    
+  }
+  return(data.frame(peptide_mapping))
+}
+
+```
+
+
+#### Two considered sequences:
+```{r}
+# Pick some sequences
+sequence1 = OrgMassSpecR::example.sequence # Human Serum Albumin
+sequence2 = "MGLSDGEWQQVLNVWGKVEADIAGHGQEVLIRLFTGHPETLEKFDKFKHLKTEAEMKASEDLKKHGTVVLTALGGILKKKGHHEAELKPLAQSHATKHKIPIKYLEFISDAIIHVLHSKHPGDFGADAQGAMTKALELFRNDIAAKYKELGFQG"
+sequences = c(sequence1, sequence2)
+```
+
+```{r}
+print(sequence1)
+```
+
+```{r}
+print(sequence2)
+```
+
+#### Define abudances for each group:    
+Group 1: 1000 and 2000, respectively   
+Group 2: 1000 and 1000, respectively   
+
+So the expected log2 fold changes are 0 and 1, respectively.    
+```{r}
+G1_mean_abundances = c(1000, 2000)
+G2_mean_abundances = c(1000, 1000)
+
+expected_FC = data.frame(Protein = sequences, Expected_FC = log2(G1_mean_abundances / G2_mean_abundances))
+```
+
+
+#### Simulate data
+Simulate 5 samples for each group
+
+```{r}
+n = 5
+
+X1 = generate_n_samples(sequences = sequences, 
+                   mean_abundances = G1_mean_abundances, 
+                   n_samples = n, 
+                   noise_fn = function(peptide_counts) peptide_counts, 
+                   samp_id_base = NULL, 
+                   enzyme = "trypsin")
+
+
+X2 = generate_n_samples(sequences = sequences, 
+                        mean_abundances = G2_mean_abundances, 
+                        n_samples = n, 
+                        noise_fn = function(peptide_counts) peptide_counts, 
+                        samp_id_base = NULL, 
+                        enzyme = "trypsin")
+
+X = full_join(X1, X2, by = 'Peptide')
+
+head(X, 20)
+```
+
+#### Preprocess using pmartR    
+- Log2 transform    
+- Median centering    
+
+```{r}
+# Generate peptide data
+pep_e_data = X
+pep_f_data = data.frame(Samp = names(pep_e_data)[names(pep_e_data) != "Peptide"], group = rep(c("1", "2"), each = n))
+pep_e_meta = get_peptide_mapping(sequences)
+
+# Make into pmart object
+pepdat = pmartR::as.pepData(e_data = pep_e_data,
+                            f_data = pep_f_data,
+                            e_meta = pep_e_meta,
+                            edata_cname = "Peptide",
+                            emeta_cname = "Protein",
+                            fdata_cname = "Samp")
+
+# Standard transformation and median centering
+pepdat = pmartR::edata_transform(pepdat, "log2")
+pepdat = pmartR::normalize_global(pepdat, subset_fn = 'all', norm_fn = "median", apply_norm = T, backtransform = F)
+pepdat = pmartR::applyFilt(pmartR::molecule_filter(pepdat), pepdat, min_num = 2)
+pepdat = pmartR::group_designation(pepdat, main_effects = 'group')
+```
+
+#### Perform rollup
+```{r}
+# Rollup
+methods = c('rollup', 'rrollup', 'zrollup')
+combine_fns = c("mean", "median")
+combinations = expand.grid(method = methods, combine_fn = combine_fns)
+out_dat = c()
+for(i in seq_len(nrow(combinations))){
+  method = combinations$method[i]
+  combine_fn = combinations$combine_fn[i]
+  single_pep = method == "zrollup"
+  
+  protdat = pmartR::protein_quant(pepdat, method, combine_fn = combine_fn, single_pep = single_pep)
+  tmp_res = imd_anova(protdat, test_method = 'anova')
+  res = data.frame(tmp_res %>% 
+                           select(Protein, starts_with("Fold_change")) %>%
+                           left_join(., expected_FC, by = 'Protein'), 
+                   Method = method, 
+                   Combine_Function = combine_fn)
+  
+  out_dat = rbind(out_dat, res)
+}
+out_dat = as_tibble(out_dat)
+```
+
+#### Compare across rollup methods
+```{r}
+ggdat = out_dat %>% mutate(SEL = (Fold_change_1_vs_2 - Expected_FC)^2)
+ggplot(ggdat, aes(x = Method, y = SEL, color = Combine_Function)) + 
+  geom_boxplot() + 
+  ylab("Squared Error Loss of log2FC Recovery") + 
+  labs(color = 'Combine Function') + 
+  theme_bw()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
