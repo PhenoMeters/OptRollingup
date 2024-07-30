@@ -1,0 +1,281 @@
+---
+title: "PTM First Pass"
+author: "Erik VonKaenel"
+date: "2024-07-16"
+output: 
+  html_document:
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+Packages
+```{r cars}
+library(OrgMassSpecR)
+library(tidyverse)
+library(pmartR)
+
+here::i_am("Code/ptm_simulation_and_dials.Rmd")
+
+source(here::here("Code", "protein_quant2.R"))
+source(here::here("Code", "ptm_utils.R"))
+
+seed = 1
+```
+
+# Simulated PTM Data
+
+Consider an protein as an amino acid sequence of length $Q$, which is modified at $R \leq Q$ distinct locations, or sites, in the sequence. Let $M$ be the absolute abundance of the sequence. For each site $r \in \{1, ..., R\}$, we uniformly sample $m_r <= M$ of the $M$ total sequences without replacement to modify at site $r$. Currently, 
+$$m_r \sim U(1, M)$$
+, where $U()$ denoted the uniform distribution, which is interpreted at the true abundance at site $r$. This can be operationalized as an $M \times R$ binary matrix $A$, where $A_{m, r} = 1$ indicates protein $m$ was modified at site $r$, and $A_{m, r} = 0$ indicates protein $m$ was not modified at site $r$. Modified proteins are then artificially digested into modified peptides, and the true modified peptide abundance is taken as the count of each unique modified peptide.
+
+Now denote the abundance of a peptide as $p$, and the set of modification sites for that peptide as $S \subset {1, ..., R}$. Then the modified peptide abundance is denoted by $p_{S}$. Additionally, consider $k = 1, ..., K$ groups, each with $N_k$ subjects. Site abundances $m_r$ are sampled separately for each group, denoted $m_{rk}$. We add site and subject effects to each peptide abundance as follows:
+$$\tilde{p}_{i, k, S} = p_{S} * \exp[\beta_{ik}] * \prod_{r \in S}\exp[\alpha_r]$$
+where $i$ denotes the subject. This results in a linear modification of the log2 abundances:
+$$\log_2 \tilde{p}_{i, k, S} = \log_2p_{S} + \beta_{ik} + \sum_{\mathcal{r \in S}} \alpha_r$$
+The subject effect acts as a random subject effect in a standard random effects model and is sampled via
+$$\beta_{ik} \sim N(0, \sigma_{subj})$$
+and the site effect represents a modification of the abundance as a change in m/z from modification at site $r$, which is sampled via
+$$\alpha_r \sim N(0, \sigma_{site})$$.    
+
+Now the expected $\log_2$ modified peptide abundance $p_{S}$ for subject $i$ in group $k$ is
+$$
+\begin{aligned}
+E\big[ \log_2 \tilde{p}_{i, k_1, S} \big] &= E\big[ \log_2p_{S} + \beta_{ik} + \Sigma_{\mathcal{r \in S}} \alpha_r \big] \\ 
+& = E\big[ \log_2p_{S} \big] + E\big[ \beta_{ik} \big] + \sum_{\mathcal{r \in S}}E\big[ \alpha_r \big] \\
+&= \log_2 p_{S}
+\end{aligned}
+$$
+
+Then the expected $\log_2$ fold change comparing groups $k_1$ and $k_2$ is given as:
+
+\begin{aligned}
+E\big[\Sigma_i \log_2 \tilde{p}_{i, k_1, S} - \Sigma_i \log_2 \tilde{p}_{i, k_2, S} \big] &= \sum_{i = 1}^{n_{k_1}} E\big[ \log_2 \tilde{p}_{i, k_1, S} \big]  - \sum_{i = 1}^{n_{k_2}} E\big[ \log_2 \tilde{p}_{i, k_2, S} \big] \\
+
+&= \sum_{i = 1}^{n_{k_1}} \log_2 \tilde{p}_{i, k_1, S} - \sum_{i = 1}^{n_{k_2}}  \log_2 \tilde{p}_{i, k_2, S} \\ 
+
+&= \log_2 \bigg[ \frac{\prod_{i = 1}^{n_{k_1}} \tilde{p}_{i, k_1, S}}{\prod_{i = 1}^{n_{k_2}} \tilde{p}_{i, k_2, S}} \bigg]
+\end{aligned}
+
+i.e. the true $\log_2$ fold change. 
+
+In this markdown, we will simulate data from one protein according to the above criteria, then evaluate the performance of rollup methods when the target is site-level data, rather than protein level data. 
+
+# Rollup Methods
+Peptide rollup generally consists of two steps: scaling and aggregation. First, all abundances for peptides that map to the same entity are scaled according to some rule, then the rescaled abundances are into a single value according to some function. Below we discuss common scaling and aggregation methods.     
+
+Scaling Methods    
+- rollup: No scaling is performed prior to aggregation.    
+- rrollup: Abundances are scaled according to a chosen reference peptide, which is the peptide with the most observations.     
+- zrollup: Abundances are first centered based on the median across all peptides that map to the entity, then scaled according to the sample standard devation.      
+
+Aggregation Methods    
+- Sum    
+- Mean    
+- Median    
+
+# Toy Example
+
+Start by using a random sequence
+
+```{r}
+set.seed(25)
+sequence = generate_random_protein(300)
+print(sequence)
+```
+
+We will target a modification on serine (S). Trypsin digestion is simulated without error.
+
+```{r}
+# set.seed(25)
+amino_acid = "S"
+identifier = "@"
+```
+
+
+## Simulation setup:    
+- 1 Protein
+- 2 groups    
+- 10 subjects per group    
+- 10000 replicates of the sequence are simulated per subject  
+- $\sigma_{subj} = 0.1$    
+- $\sigma_{site} = 0.1$    
+- 1 simulated datasets
+
+Set simulation values:
+```{r}
+set.seed(seed)
+sequence_abundances = c(1000, 1000)
+
+ptm_site_mapping = get_ptm_site_mapping(sequence, amino_acid)
+site_sd = 0.1
+site_coefs = rnorm(length(unique(ptm_site_mapping$site)), sd = site_sd)
+
+n_per_group = 10
+subject_effect_sd = 0.1
+subject_coefs = rnorm(n_per_group * 2, sd = subject_effect_sd)
+```
+
+Simulate data:
+```{r}
+set.seed(seed)
+out = generate_ptm_samples_for_sequence(ptm_site_mapping,
+                                        sequence_abundances,
+                                        subject_coefs,
+                                        site_coefs,
+                                        group_ids = rep(c(1, 2), each = n_per_group))
+
+ground_truth = data.frame(site = rownames(out$ground_truth), 
+                          G1 = out$ground_truth[,1], 
+                          G2 = out$ground_truth[,2]) %>%
+  mutate(true_fold_change = log2(G1 / G2)) %>%
+  select(site, true_fold_change)
+
+f_data_full = data.frame(sample = out$e_data %>% select(-peptide) %>% names,
+                         group = rep(c(1, 2), each = n_per_group))
+```
+
+```{r}
+pepdat = as.pepData(e_data = out$e_data,
+                    f_data = f_data_full,
+                    e_meta = out$e_meta %>% select(-group, -true_peptide_count) %>% distinct(),
+                    edata_cname = "peptide",
+                    fdata_cname = "sample",
+                    emeta_cname = "site")
+head(pepdat$e_data, 10) %>% knitr::kable()
+```
+
+Pre-process data:
+```{r}
+pepdat = pmartR::edata_transform(pepdat, "log2")
+pepdat = pmartR::normalize_global(pepdat, subset_fn = 'all', norm_fn = "median", apply_norm = T, backtransform = F)
+pepdat = pmartR::applyFilt(pmartR::molecule_filter(pepdat), pepdat, min_num = 2)
+pepdat = pmartR::group_designation(pepdat, main_effects = 'group')
+```
+
+Rollup:
+```{r}
+methods = c('rollup', 'rrollup', 'zrollup')
+combine_fns = c("mean", "median", "sum")
+combinations = expand.grid(method = methods, combine_fn = combine_fns)
+out_dat = c()
+for(i in seq_len(nrow(combinations))){
+  method = combinations$method[i]
+  combine_fn = combinations$combine_fn[i]
+  single_pep = method == "zrollup"
+  
+  sitedat = protein_quant2(pepdat, method, combine_fn = combine_fn, single_pep = single_pep)
+  tmp_res = imd_anova(sitedat, test_method = 'anova')
+  res = data.frame(tmp_res %>% 
+                     select(site, starts_with("Fold_change")) %>%
+                     left_join(., ground_truth, by = 'site'), 
+                   Method = method, 
+                   Combine_Function = combine_fn)
+  
+  out_dat = rbind(out_dat, res)
+}
+out_dat = as_tibble(out_dat)
+```
+
+Performance for each method compared to ground truth:
+```{r}
+ggdat = out_dat %>% mutate(SEL = (Fold_change_1_vs_2 - true_fold_change)^2)
+ggplot(ggdat, aes(x = Method, y = SEL, color = Combine_Function)) + 
+  geom_boxplot() + 
+  ylab("Squared Error Loss of log2FC Recovery") + 
+  labs(color = 'Combine Function') + 
+  theme_bw()
+```
+
+
+# Expanded Toy Example
+
+Same setup as above, but repeated over 100 simulated datasets.
+
+Set simulation values:
+```{r}
+set.seed(seed)
+sequence_abundances = c(1000, 1000)
+
+ptm_site_mapping = get_ptm_site_mapping(sequence, amino_acid)
+site_sd = 0.1
+site_coefs = rnorm(length(unique(ptm_site_mapping$site)), sd = site_sd)
+
+n_per_group = 10
+subject_effect_sd = 0.1
+subject_coefs = rnorm(n_per_group * 2, sd = subject_effect_sd)
+```
+
+Simulation:
+```{r}
+n_replicates = 100
+set.seed(seed)
+
+out_dat = c()
+for(rr in seq_len(n_replicates)){
+  out = generate_ptm_samples_for_sequence(ptm_site_mapping,
+                                          sequence_abundances,
+                                          subject_coefs,
+                                          site_coefs,
+                                          group_ids = rep(c(1, 2), each = n_per_group))
+  
+  ground_truth = data.frame(site = rownames(out$ground_truth), 
+                            G1 = out$ground_truth[,1], 
+                            G2 = out$ground_truth[,2]) %>%
+    mutate(true_fold_change = log2(G1 / G2)) %>%
+    select(site, true_fold_change)
+  
+  f_data_full = data.frame(sample = out$e_data %>% select(-peptide) %>% names,
+                           group = rep(c(1, 2), each = n_per_group))
+  
+  pepdat = as.pepData(e_data = out$e_data,
+                    f_data = f_data_full,
+                    e_meta = out$e_meta %>% select(-group, -true_peptide_count) %>% distinct(),
+                    edata_cname = "peptide",
+                    fdata_cname = "sample",
+                    emeta_cname = "site")
+  
+  pepdat = pmartR::edata_transform(pepdat, "log2")
+  pepdat = pmartR::normalize_global(pepdat, subset_fn = 'all', norm_fn = "median", apply_norm = T, backtransform = F)
+  pepdat = pmartR::applyFilt(pmartR::molecule_filter(pepdat), pepdat, min_num = 2)
+  pepdat = pmartR::group_designation(pepdat, main_effects = 'group')
+  
+  methods = c('rollup', 'rrollup', 'zrollup')
+  combine_fns = c("mean", "median", "sum")
+  combinations = expand.grid(method = methods, combine_fn = combine_fns)
+  for(i in seq_len(nrow(combinations))){
+    method = combinations$method[i]
+    combine_fn = combinations$combine_fn[i]
+    single_pep = method == "zrollup"
+    
+    sitedat = protein_quant2(pepdat, method, combine_fn = combine_fn, single_pep = single_pep)
+    tmp_res = imd_anova(sitedat, test_method = 'anova')
+    res = data.frame(tmp_res %>% 
+                       select(site, starts_with("Fold_change")) %>%
+                       left_join(., ground_truth, by = 'site'), 
+                     Method = method, 
+                     Combine_Function = combine_fn,
+                     replicate = rr)
+    
+    out_dat = rbind(out_dat, res)
+  }
+}
+out_dat = as_tibble(out_dat)
+
+```
+
+Performance for each method compared to ground truth:
+```{r}
+ggdat = out_dat %>% mutate(SEL = (Fold_change_1_vs_2 - true_fold_change)^2)
+ggplot(ggdat, aes(x = Method, y = SEL, color = Combine_Function)) + 
+  geom_boxplot() + 
+  ylab("Squared Error Loss of log2FC Recovery") + 
+  labs(color = 'Combine Function') + 
+  theme_bw()
+```
+
+

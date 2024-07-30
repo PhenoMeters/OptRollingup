@@ -1,8 +1,7 @@
 get_binned_abundaces = function(omicsData, bins){
-  browser()
   edata_cname = get_edata_cname(omicsData)
   
-  raw_vals <- omicsData$e_data[-which(names(omicsData$e_data) == edata_cname)]
+  raw_vals <- as.matrix(omicsData$e_data[-which(names(omicsData$e_data) == edata_cname)])
   
   # Generate means and missingness percents per each peptide
   means <- apply(raw_vals, 1, \(x) mean(x, na.rm = TRUE))
@@ -17,7 +16,7 @@ get_binned_abundaces = function(omicsData, bins){
   n_bins <- as.numeric(n_bins)
   
   # Calculate the bin medians and use this to calculate the probability of selection
-  bin_medians <- sapply(seq_len(bins), \(x) median(raw_vals[which(q_bins == levels(q_bins)[x])]))
+  bin_medians <- sapply(seq_len(bins), \(x) median(raw_vals[which(q_bins == levels(q_bins)[x])], na.rm = TRUE))
   
   return(list(binned_peps = binned_peps, bin_medians = bin_medians))
 }
