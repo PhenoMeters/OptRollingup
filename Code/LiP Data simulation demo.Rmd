@@ -1,0 +1,716 @@
+---
+title: "LiP Data Simulation Demo"
+author: "Erik VonKaenel"
+date: "2024-08-27"
+output: 
+  html_document:
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+#packages
+library(ggplot2)
+library(dplyr)
+library(OrgMassSpecR)
+library(pmartR)
+library(tidyverse)
+```
+
+```{r}
+#utils
+here::i_am("Code/protein_sequence_simulation.R")
+
+source(here::here("Code", "ptm_utils.R"))
+source(here::here("Code", "LiP_utils.R"))
+```
+
+# Simulating LiP Data
+
+## The data simulation process:
+
+Lets start by generating a single synthetic protein:
+
+```{r}
+lip_data = readr::read_tsv(here::here("Data", "double_pept_lytic_sites.tsv"))
+
+all_peptides = unlist(lapply(lip_data$Sequence, \(x) strsplit(x, split = '; ')[[1]]))
+
+unique_peptides = unique(all_peptides)
+
+amino_acids = unlist(lapply(unique_peptides, \(x) strsplit(x, split = "")[[1]]))
+
+amino_acid_distribution = create_amino_acid_distribution(amino_acids)
+```
+
+
+```{r}
+# set.seed(349)
+# set.seed(42)
+set.seed(349857)
+synthetic_proteins = list(
+  generate_protein(2000, amino_acid_distribution)#,
+  # generate_protein(1000, amino_acid_distribution)
+  )
+synthetic_proteins
+```
+
+We mask this protein in chunks to simulate protein folding:
+
+```{r}
+sample_gap = function() rpois(1, 20)
+sample_delay = function() rpois(1, 3)
+downsample_fn = function(vec, prop) sample(vec, floor(prop * length(vec)))
+
+max_masked_region_size = 100
+min_num_trypsin_sites = 2
+
+full_masking = mask_all_proteins(
+    sequences = synthetic_proteins,
+    delay_fn = sample_delay,
+    gap_fn = sample_gap,
+    max_masked_region_size = max_masked_region_size,
+    min_num_trypsin_sites = min_num_trypsin_sites
+  )
+
+full_masking[[1]]$masked_sequence
+```
+
+We interpret this masking as the "full" or "complete" masking, and we simulate group differences with a simple downsampling of the masked regions.    
+
+So the masking for group 1:    
+```{r}
+g1_masking = downsample_maskings(full_masking, downsample_fn, prop = 0.5)
+g1_masking[[1]]$masked_sequence
+```
+
+and for group 2:    
+```{r}
+g2_masking = downsample_maskings(full_masking, downsample_fn, prop = 0.5)
+g2_masking[[1]]$masked_sequence
+```
+
+Our goal is to simulate reasonable enough data which can be used to provide guidance on which rollup method(s) can better detect structural differences proteins, i.e. differences in where folded (masked) regions exist. The special spice is how the digestion happens, or more specifically how the digestion is varied across and within subjects. To simulate the two stage digestion in LiP, we start with a masked proteinaise K digestion, followed by an unmasked trypsin digestion.    
+
+For both digestion steps, we start with a "perfect" digestion, then downsample and merge cleaved peptides to simulate an imperfect digestion. Below is the perfect proteinase K digestion for group 1:
+```{r}
+digest_proteins_PK = function(sequences){
+  lapply(sequences, \(x) simulate_proteinase_k_cleavage(x))
+}
+
+digest_proteins_trypsin = function(sequences){
+  lapply(sequences, \(x) simulate_trypsin_cleavage(x))
+}
+
+get_masked_sequences = function(masking_list){
+  lapply(masking_list, \(x) x$masked_sequence)
+}
+get_sequences = function(masking_list){
+  lapply(masking_list, \(x) x$sequence)
+}
+
+g1_pk_perfect_digestion = digest_proteins_PK(get_masked_sequences(g1_masking))
+g2_pk_perfect_digestion = digest_proteins_PK(get_masked_sequences(g2_masking))
+
+g1_pk_perfect_digestion[[1]]# %>% knitr::kable()
+```
+
+We downsample the digestion for proteinase K and trypsin separately by specifying a proportion of cleavages to miss. We can also specify a probability for each cleaveage site to be missed. For now we assume uniform probabilities. Below is one instance of inperfect proteinase K digestion results for group 1 when we miss 50% of proteinase K cleavages:    
+
+```{r}
+imperfect_digest = function(
+    ptm_site_mapping, 
+    prop_to_miss, 
+    prob = NULL
+    ){
+  n_peps = nrow(ptm_site_mapping)
+  # coef_dat = data.frame(peptide = names(peptide_coef), Mult_Factor = exp(peptide_coef))
+  # ptm_site_mapping = ptm_site_mapping %>% left_join(., coef_dat, by = "peptide")
+  
+  # TODO does the probability of a successful split depend on the peptide length?
+  ptm_site_mapping$merge_with_next = seq_len(n_peps) %in% sample(seq_len(n_peps)[-n_peps], round(prop_to_miss * (n_peps - 1)), prob = prob)
+  protein = ptm_site_mapping$protein %>% unique()
+  
+  remove_vec = rep(FALSE, nrow(ptm_site_mapping))
+  # ptm_site_mapping = ptm_site_mapping %>% as_tibble()
+  
+  for(i in seq_len(nrow(ptm_site_mapping) - 1)){
+    if(ptm_site_mapping$merge_with_next[i]){
+      peptide = paste0(ptm_site_mapping$peptide[i], ptm_site_mapping$peptide[i + 1])
+      start = ptm_site_mapping$start[i]
+      stop = ptm_site_mapping$stop[i + 1]
+      remove_vec[i] = TRUE
+      merge_with_next = ptm_site_mapping$merge_with_next[i+1]
+      
+      
+      ptm_site_mapping$peptide[i + 1] = peptide
+      ptm_site_mapping$start[i + 1] = start
+      ptm_site_mapping$stop[i + 1] = stop
+      ptm_site_mapping$merge_with_next[i + 1] = merge_with_next
+    }
+  }
+  return(ptm_site_mapping[!remove_vec,])
+}
+
+adjust_digestions = function(full_digest_results, ...){
+  lapply(full_digest_results, \(x) imperfect_digest(x, ...))
+}
+
+imperfect_digest(g1_pk_perfect_digestion[[1]], 0.5) %>% select(-merge_with_next) # %>% knitr::kable()
+```
+
+```{r}
+get_cleavage_site_mapping = function(mask_out, pk_missed_prop, tr_missed_prop, pk_prob = NULL, tr_prob = NULL){
+  digest_results_PK = adjust_digestions(digest_proteins_PK(get_masked_sequences(mask_out)), prop_to_miss = pk_missed_prop, prob = pk_prob)
+  digest_results_tryp = adjust_digestions(digest_proteins_trypsin(get_sequences(mask_out)), prop_to_miss = tr_missed_prop, prob = tr_prob)
+  
+  proteinaseK_cleavage_sites = lapply(digest_results_PK, \(x) x$start[-1])
+  trypsin_cleavage_sites = lapply(digest_results_tryp, \(x) x$start[-1])
+  
+  PK_dat = lapply(proteinaseK_cleavage_sites, \(x) data.frame(Site = x, PK = 1))
+  TR_dat = lapply(trypsin_cleavage_sites, \(x) data.frame(Site = x, TR = -1))
+  full_dat = lapply(
+    seq_along(PK_dat), 
+    \(x) full_join(PK_dat[[x]], TR_dat[[x]], by = "Site") %>% 
+      tidyr::replace_na(., list(PK = 0, TR = 0)) %>%
+      mutate(
+        sum_col = PK + TR,
+        Enzyme = case_match(
+        sum_col,
+        -1 ~ "Trypsin",
+        0 ~ "Proteinase K", # 0 is proteinase K because a trypsin cleavage cannot occur if a PK one already did
+        1 ~ "Proteinase K"
+      )) %>%
+      select(Site, Enzyme) %>%
+      arrange(Site)
+    )
+  
+  return(full_dat)
+}
+```
+
+Since all proteins will be digested slightly differently and the digestion variability is what drives this simulation study, we implement a brute force approach by digesting each protein separately. Lets start with just 100 replicates of this protein per subject, for 20 subjects in each group. The minimum information we need to proceed for each protein is the cleavage site and the enzyme which was responsible for cleavage at that site:
+
+```{r}
+# do this once for each protein
+cleavage_mapping_example = get_cleavage_site_mapping(
+  g1_masking,
+  0.5,
+  0.5
+)
+
+cleavage_mapping_example[[1]] %>% head(10)
+```
+
+
+
+
+```{r}
+get_peptides_before_cleavage = function(sequence, cleavage_site_mapping){
+  curr_start = 1
+  peptides = c()
+  for(i in seq_len(nrow(cleavage_site_mapping))){
+    curr_stop = cleavage_site_mapping$Site[i] - 1
+    peptides = c(peptides, substr(sequence, start = curr_start, stop = curr_stop))
+    curr_start = curr_stop + 1
+  }
+  return(peptides)
+}
+
+get_peptides_after_cleavage = function(sequence, cleavage_site_mapping){
+  peptides = c()
+  for(i in seq_len(nrow(cleavage_site_mapping) - 1)){
+    curr_start = cleavage_site_mapping$Site[i]
+    curr_stop = cleavage_site_mapping$Site[i + 1] - 1
+    peptides = c(peptides, substr(sequence, start = curr_start, stop = curr_stop))
+  }
+  curr_start = cleavage_site_mapping$Site[i + 1]
+  curr_stop = nchar(sequence)
+  peptides = c(peptides, substr(sequence, start = curr_start, stop = curr_stop))
+  
+  return(peptides)
+}
+
+get_peptide_abundances = function(sequences, cleavage_site_mapping, sequence_abundances = 1){
+  prior_peptide_vec = c()
+  out = vector("list", length(sequences))
+  for(i in seq_along(sequences)){
+    peptides_before_cleavage = get_peptides_before_cleavage(
+      sequences[[i]],
+      cleavage_site_mapping[[i]]
+    )
+    peptides_after_cleavage = get_peptides_after_cleavage(
+      sequences[[i]],
+      cleavage_site_mapping[[i]]
+    )
+    cleavage_site_mapping[[i]]$PriorPeptide = peptides_before_cleavage
+    cleavage_site_mapping[[i]]$PosteriorPeptide = peptides_after_cleavage
+    out[[i]] = data.frame(peptide = c(peptides_before_cleavage[1], peptides_after_cleavage), start_site = c(1, cleavage_site_mapping[[i]]$Site), abundance = sequence_abundances[i])
+  }
+  return(list(abundances = out, cleavage_site_mapping = cleavage_site_mapping))
+}
+
+
+
+```
+
+For a synthetic protein, we can set simulated peptide abundances as the number of times a peptide was observed given the digestion scheme. Below is the distribution of peptide abundances across 1000 runs of our two stage digestion. 
+
+```{r}
+simulate_protein_for_sample = function(n_reps, mask_out, pk_missed_prop, tr_missed_prop, sequences, pk_prob = NULL, tr_prob = NULL){
+  peptide_abundances = vector("list", n_reps)
+  cleavage_mappings = vector("list", n_reps)
+  for(i in seq_len(n_reps)){
+    cleavage_mapping_example = get_cleavage_site_mapping(
+      mask_out,
+      pk_missed_prop,
+      tr_missed_prop,
+      pk_prob,
+      tr_prob)
+    tmp = get_peptide_abundances(
+      sequences,
+      cleavage_mapping_example)
+    peptide_abundances[[i]] = tmp$abundances[[1]]
+    cleavage_mappings[[i]] = tmp$cleavage_site_mapping[[1]]
+  }
+  full_peptide_df = peptide_abundances %>% 
+    purrr::reduce(., rbind) %>%
+    group_by(start_site, peptide) %>% 
+    summarise(abundance = sum(abundance)) %>% 
+    ungroup()
+  full_cleavage_mapping = cleavage_mappings %>% 
+    purrr::reduce(., rbind)
+    # arrange(start_site)
+    return(list(peptide_df = full_peptide_df, cleavage_mapping = full_cleavage_mapping))
+}
+# test_out = simulate_protein_for_sample(1000, g1_masking, 0.2, 0.2)
+# test_out$peptide_df %>% pull(abundance) %>% table %>% hist(breaks = length(.))
+```
+
+## Site level rollup: First attempt
+### (Relative) Abundance + ANOVA
+
+Now we simulate data across two groups with 20 subjects each. 100 digestion runs are performed on the synthetic protein. 
+
+```{r}
+
+n_g1 = 20
+n_g2 = 20
+
+
+simulate_protein_for_group = function(n_subjects, group_id, n_reps, mask_out, pk_missed_prop, tr_missed_prop, sequences, pk_prob = NULL, tr_prob = NULL){
+  full_pep_list = vector("list", n_subjects)
+  full_cleavage_mapping = vector("list", n_subjects)
+  for(i in seq_len(n_subjects)){
+    out = simulate_protein_for_sample(n_reps, mask_out, pk_missed_prop, tr_missed_prop, sequences, pk_prob, tr_prob)
+    full_pep_list[[i]] = out$peptide_df
+    full_cleavage_mapping[[i]] = out$cleavage_mapping
+  }
+  full_pep_list = purrr::reduce(full_pep_list, full_join, by = c("start_site", "peptide"))
+  full_cleavage_mapping = purrr::reduce(full_cleavage_mapping, rbind)
+  names(full_pep_list)[-c(1, 2)] = paste("subject", seq_len(n_subjects), "group", group_id, sep = '_')
+  return(list(peptide_df = full_pep_list, cleavage_mapping = full_cleavage_mapping))
+}
+
+
+g1_dat = simulate_protein_for_group(
+  n_g1, 
+  1, 
+  200, 
+  g1_masking, 
+  0.2, 
+  0.2, 
+  synthetic_proteins)
+
+g2_dat = simulate_protein_for_group(
+  n_g2, 
+  2, 
+  200, 
+  g2_masking, 
+  0.2, 
+  0.2, 
+  synthetic_proteins)
+```
+
+As standard procedure, the abundance data are first log2 transformed then normalized using the median. 
+
+```{r}
+full_pep_data = full_join(g1_dat$peptide_df, g2_dat$peptide_df, by = c("peptide", "start_site"))
+
+head(full_pep_data, 50) %>% knitr::kable()
+
+generate_f_data = function(full_abundance_df){
+  subject_ids = names(full_abundance_df)[-which(names(full_abundance_df) %in% c('start_site', 'peptide'))]
+  f_data = data.frame(Subject_IDs = subject_ids) %>% 
+  mutate(Group_IDs = sapply(strsplit(Subject_IDs, '_'), function(x) x[4]))
+  return(f_data)
+}
+
+f_data = generate_f_data(full_pep_data)
+
+
+pep_data = pmartR::as.pepData(
+  e_data = full_pep_data %>% ungroup() %>% mutate(Peptide_Site = paste(start_site, peptide, sep = '_')) %>% select(-start_site, -peptide),
+  f_data = f_data,
+  edata_cname = "Peptide_Site",
+  fdata_cname = "Subject_IDs")
+
+pep_data = pep_data %>% 
+  pmartR::edata_transform(., 'log2') %>%
+  pmartR::normalize_global(., "all", "median", apply_norm = T)
+
+full_pep_data = pep_data$e_data %>%
+  mutate(
+    peptide = sapply(Peptide_Site, \(x) strsplit(x, split = '_')[[1]][2]),
+    start_site = as.numeric(sapply(Peptide_Site, \(x) strsplit(x, split = '_')[[1]][1]))
+    ) %>%
+  select(-Peptide_Site)
+```
+
+Here we roll up to the cleavage site level by taking the mean of the abundance for all measured peptides adjacent to each cleavage site. The log2 fold change is computed for each site across groups. Note that we separate the analysis for proteinase K and trypsin sites. 
+
+```{r}
+full_cleavage_mapping = rbind(
+  g1_dat$cleavage_mapping %>% distinct,
+  g2_dat$cleavage_mapping %>% distinct
+  ) %>% 
+  distinct() %>%
+  pivot_longer(c("PriorPeptide", "PosteriorPeptide"), values_to = "Peptide", names_to = "Type")
+
+
+data_for_rollup = full_pep_data %>% 
+  rename(Site = start_site, Peptide = peptide) %>% 
+  left_join(., full_cleavage_mapping, by = c("Site", "Peptide")) %>% 
+  drop_na(., Enzyme, Type)
+
+rolled_up_data = data_for_rollup %>% group_by(Site, Enzyme) %>% select(-Type) %>% summarize_if(is.numeric, mean, na.rm = T)
+```
+
+
+```{r}
+
+site_data = pmartR::as.pepData(
+  e_data = rolled_up_data %>% ungroup() %>% mutate(Site_Type = paste(Site, Enzyme, sep = '_')) %>% select(-Site, -Enzyme),
+  f_data = f_data,
+  edata_cname = "Site_Type",
+  fdata_cname = "Subject_IDs",
+  data_scale = "log2")
+
+
+site_data = site_data %>% group_designation(., main_effects = "Group_IDs")
+res = site_data %>% imd_anova(., test_method = "anova")
+```
+
+Here is a plot visualing the estimated fold change across sites for both proteinase K and trypsin cleavage sites (black line). The filled in background regions indicate the masking pattern of the sequence across groups.
+
+```{r}
+ggdat = res %>% 
+  select(Site_Type, 
+         Fold_change_1_vs_2) %>% 
+  rename(FC = Fold_change_1_vs_2) %>%
+  mutate(
+    Site = as.numeric(sapply(Site_Type, \(x) strsplit(x, split = '_')[[1]][1])),
+    Enzyme = sapply(Site_Type, \(x) strsplit(x, split = '_')[[1]][2])
+    ) %>%
+  select(-Site_Type)
+
+masking_data = data.frame(
+  Site = seq_len(nchar(g1_masking[[1]]$sequence)),
+  group_1 = strsplit(g1_masking[[1]]$masked_sequence, '')[[1]],
+  group_2 = strsplit(g2_masking[[1]]$masked_sequence, '')[[1]]) %>%
+  mutate(
+    cat = paste0(group_1, group_2),
+    category = case_when(
+      cat == "##" ~ "Both",
+      grepl("#[A-Za-z]", cat) ~ "Group 1 Only",
+      grepl("[A-Za-z]#", cat) ~ "Group 2 Only",
+      grepl("[A-Za-z][A-Za-z]", cat) ~ "Neither"
+    )
+  )
+
+# Create a complete sequence of Sites
+all_sites <- data.frame(Site = seq(min(masking_data$Site), max(masking_data$Site)))
+
+# Merge all_sites with ggdat and masking_data
+plot_data_1 <- all_sites %>%
+  left_join(masking_data, by = "Site") %>%
+  mutate(Enzyme = "Trypsin")
+plot_data_2 <- all_sites %>%
+  left_join(masking_data, by = "Site") %>%
+  mutate(Enzyme = "Proteinase K")
+plot_data = rbind(plot_data_1, plot_data_2) %>%
+  select(-group_1, -group_2, -cat) %>%
+  left_join(., ggdat, by = c("Site", "Enzyme"))
+
+# Separate the data for the line plot (where FC is not NA)
+line_data <- plot_data %>%
+  filter(!is.na(FC))
+
+# Creating the plot with faceting
+ggplot() + 
+  geom_tile(data = plot_data, aes(x = Site, y = (max(line_data$FC, na.rm = TRUE) + min(line_data$FC, na.rm = TRUE)) / 2, fill = category), height = max(line_data$FC, na.rm = TRUE) - min(line_data$FC, na.rm = TRUE), alpha = 0.2) + 
+  geom_line(data = line_data, aes(x = Site, y = FC)) + 
+  theme_bw() +
+  scale_fill_manual(values = c("Neither" = "gray", "Both" = "blue", "Group 1 Only" = "orange", "Group 2 Only" = "green")) +
+  labs(fill = "Region Masked?") + 
+  ylab("Difference in Proportion of Samples with Cleavage") +
+  facet_wrap(~ Enzyme)
+
+```
+
+## Problem!
+But something looks off... without knowing the true masking pattern(s) how can we possibly make sense of these fold changes? There is a suble problem in this workflow. Lets take a look at the abundance data for peptides within the first "green" region in the above plot, that is, the first region along the protein sequence which is masked in one group (2) and not in the other (1). This lies between sites 136 and 159.
+
+```{r}
+data_for_rollup %>% filter(Site %in% 136:159 & Enzyme == "Proteinase K") %>% knitr::kable()
+```
+
+And here is the corresponding (rolled up) site level data
+
+```{r}
+rolled_up_data %>% filter(Site %in% 136:159) %>% knitr::kable()
+```
+
+Notice any problems?    
+
+Skipping to the punchline, we do not have (and should not expect) any measured abundances for proteinase K sites in group 2 since we masked it! So we must resort to a detect/non-detect strategy where we set the value for a peptide as 0 if it was not detected (NA), and 1 otherwise.
+
+
+## Site level rollup: Second Attempt
+### Detect/non-detect + GLM
+```{r}
+det_nondet_data = data_for_rollup %>%
+  mutate(across(-c(Peptide, Site, Enzyme, Type), ~ ifelse(is.na(.), 0, 1)))
+
+
+det_nondet_rolled_up_data = det_nondet_data %>% group_by(Site, Enzyme) %>% select(-Type) %>% summarize_if(is.numeric, mean, na.rm = T)
+```
+
+Now we can still roll up to the site level, but depending on our method we will need to use slightly different statistical models for determining differential detection. For now, lets stick with using the mean to roll up to the site level. Below is our newly rolled up data for the previously considered region:
+
+```{r}
+det_nondet_rolled_up_data %>% filter(Site %in% 136:159) %>% knitr::kable()
+```
+
+To test group differences, we will use a GLM. Since we are using the mean here, lets fit a series of logistic regression models similar to standard ANOVA based methods for testing group differences. At each site, we can estimate the log odds of observing a trypsin or proteinase K, at each site, for group 1 vs group 2. The black line below represents the log odds, so large positive values indicate the probability of group 1 having a cleavage of the specified type at that site is large relative to group 2. Alternatively, large negative values indicate the probability of group 1 having a cleavage of the specified type at that site is small relative to group 2. Log odds of 0 indicate there is an equal probability of each group having a cleavage at that site. So below, for proteinaise K, we expect large log odds in the orange regions, small log odds in the green regions, and zero log odds everywhere else:
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+# Reshape data to long format
+long_data <- det_nondet_rolled_up_data %>%
+  pivot_longer(cols = -c(Site, Enzyme), names_to = "SampleID", values_to = "Y")
+
+# Extract group information from the variable names
+long_data <- long_data %>%
+  mutate(group = ifelse(grepl("group_1", SampleID), 1, 2))
+
+# # Function to fit logistic regression for a single row
+# fit_logistic <- function(values, groups) {
+#   data <- data.frame(value = values, group = groups)
+#   # Ensure the outcome variable is binary
+#   data$value <- ifelse(data$value > 0.5, 1, 0)
+#   model <- glm(value ~ group, data = data, family = binomial)
+#   summary(model)$coefficients
+# }
+# 
+# # Apply the logistic regression function to each row
+# results <- long_data %>%
+#   group_by(Site, Enzyme) %>%
+#   summarise(model_results = list(fit_logistic(value, group)))
+
+
+res = long_data %>% 
+  mutate(Y_bin = ifelse(Y > 0.5, 1, 0)) %>%
+  ungroup() %>% 
+  nest_by(Site, Enzyme) %>%
+  mutate(res = list(glm(Y_bin ~ group, data = data, family = binomial))) %>%
+  mutate(logodds = sum(coef(res) * c(0, 1)),
+         est_prop = exp(logodds) / (1 + exp(logodds)))
+
+
+
+```
+
+```{r, fig.height = 16, fig.width = 20}
+ggdat = res %>% 
+  select(Site, 
+         Enzyme,
+         logodds) %>% 
+  rename(FC = logodds)
+
+masking_data = data.frame(
+  Site = seq_len(nchar(g1_masking[[1]]$sequence)),
+  group_1 = strsplit(g1_masking[[1]]$masked_sequence, '')[[1]],
+  group_2 = strsplit(g2_masking[[1]]$masked_sequence, '')[[1]]) %>%
+  mutate(
+    cat = paste0(group_1, group_2),
+    category = case_when(
+      cat == "##" ~ "Both",
+      grepl("#[A-Za-z]", cat) ~ "Group 1 Only",
+      grepl("[A-Za-z]#", cat) ~ "Group 2 Only",
+      grepl("[A-Za-z][A-Za-z]", cat) ~ "Neither"
+    )
+  )
+
+# Create a complete sequence of Sites
+all_sites <- data.frame(Site = seq(min(masking_data$Site), max(masking_data$Site)))
+
+# Merge all_sites with ggdat and masking_data
+plot_data_1 <- all_sites %>%
+  left_join(masking_data, by = "Site") %>%
+  mutate(Enzyme = "Trypsin")
+plot_data_2 <- all_sites %>%
+  left_join(masking_data, by = "Site") %>%
+  mutate(Enzyme = "Proteinase K")
+plot_data = rbind(plot_data_1, plot_data_2) %>%
+  select(-group_1, -group_2, -cat) %>%
+  left_join(., ggdat, by = c("Site", "Enzyme"))
+
+# Separate the data for the line plot (where FC is not NA)
+line_data <- plot_data %>%
+  filter(!is.na(FC))
+
+# Creating the plot with faceting
+ggplot() + 
+  geom_tile(data = plot_data, aes(x = Site, y = (max(line_data$FC, na.rm = TRUE) + min(line_data$FC, na.rm = TRUE)) / 2, fill = category), height = max(line_data$FC, na.rm = TRUE) - min(line_data$FC, na.rm = TRUE), alpha = 0.2) + 
+  geom_line(data = line_data, aes(x = Site, y = FC)) + 
+  theme_bw() +
+  scale_fill_manual(values = c("Neither" = "gray", "Both" = "blue", "Group 1 Only" = "orange", "Group 2 Only" = "green")) +
+  labs(fill = "Region Masked?") + 
+  ylab("Difference in Proportion of Samples with Cleavage") +
+  facet_wrap(~ Enzyme, ncol = 1)
+
+```
+
+
+# Bingo! We've nailed it. 
+
+# Now what about the competing approach?
+
+```{r}
+full_cleavage_mapping = rbind(
+  g1_dat$cleavage_mapping %>% distinct,
+  g2_dat$cleavage_mapping %>% distinct
+  ) %>% 
+  distinct() %>%
+  as_tibble()
+
+d1 = full_cleavage_mapping %>% 
+  filter(Enzyme == "Trypsin") %>% 
+  arrange(Site) %>%
+  select(-PriorPeptide) %>%
+  rename(Start_Location = Site,
+         Start_Location_Enzyme = Enzyme,
+         Peptide = PosteriorPeptide) %>%
+  mutate(End_Location = nchar(Peptide) + Start_Location) %>%
+  distinct()
+
+
+d2 = full_cleavage_mapping %>% 
+  filter(Enzyme == "Trypsin") %>% 
+  arrange(Site) %>%
+  select(-PosteriorPeptide) %>%
+  rename(End_Location = Site,
+         Start_Location_Enzyme = Enzyme,
+         Peptide = PriorPeptide) %>%
+  distinct()
+
+tryptic_peptides = inner_join(d1, d2, by = c("End_Location", "Peptide", "Start_Location_Enzyme"))
+```
+
+
+```{r}
+tryptic_peptides
+
+tryptic_pep_edata = full_pep_data %>% filter(start_site %in% tryptic_peptides$Start_Location & peptide %in% tryptic_peptides$Peptide)
+
+tryptic_pep_data = pmartR::as.pepData(
+  e_data = tryptic_pep_edata %>% ungroup() %>% mutate(Peptide_Site = paste(peptide, start_site, sep = '_')) %>% select(-start_site, -peptide),
+  f_data = f_data,
+  edata_cname = "Peptide_Site",
+  fdata_cname = "Subject_IDs",
+  data_scale = "log2")
+
+
+tryptic_pep_data = tryptic_pep_data %>% group_designation(., main_effects = "Group_IDs")
+res = tryptic_pep_data %>% imd_anova(., test_method = "anova")
+
+plot(res)
+```
+
+
+```{r, fig.height = 8, fig.width = 20}
+ggdat = res %>% 
+  select(Peptide_Site, 
+         Fold_change_1_vs_2) %>% 
+  rename(FC = Fold_change_1_vs_2) %>%
+  mutate(
+    Peptide = sapply(Peptide_Site, \(x) strsplit(x, split = '_')[[1]][1]),
+    Site = as.numeric(sapply(Peptide_Site, \(x) strsplit(x, split = '_')[[1]][2])),
+    Enzyme = "Trypsin"
+    ) %>%
+  select(-Peptide_Site)
+
+masking_data = data.frame(
+  Site = seq_len(nchar(g1_masking[[1]]$sequence)),
+  group_1 = strsplit(g1_masking[[1]]$masked_sequence, '')[[1]],
+  group_2 = strsplit(g2_masking[[1]]$masked_sequence, '')[[1]]) %>%
+  mutate(
+    cat = paste0(group_1, group_2),
+    category = case_when(
+      cat == "##" ~ "Both",
+      grepl("#[A-Za-z]", cat) ~ "Group 1 Only",
+      grepl("[A-Za-z]#", cat) ~ "Group 2 Only",
+      grepl("[A-Za-z][A-Za-z]", cat) ~ "Neither"
+    )
+  )
+
+# Create a complete sequence of Sites
+all_sites <- data.frame(Site = seq(min(masking_data$Site), max(masking_data$Site)))
+
+# Merge all_sites with ggdat and masking_data
+plot_data_1 <- all_sites %>%
+  left_join(masking_data, by = "Site") %>%
+  mutate(Enzyme = "Trypsin")
+plot_data_2 <- all_sites %>%
+  left_join(masking_data, by = "Site") %>%
+  mutate(Enzyme = "Proteinase K")
+plot_data = rbind(plot_data_1, plot_data_2) %>%
+  select(-group_1, -group_2, -cat) %>%
+  left_join(., ggdat, by = c("Site", "Enzyme"))
+
+plot_data = plot_data %>% filter(Enzyme == "Trypsin")
+
+# Separate the data for the line plot (where FC is not NA)
+line_data <- plot_data %>%
+  filter(!is.na(FC))
+
+# Creating the plot with faceting
+ggplot() + 
+  geom_tile(data = plot_data, aes(x = Site, y = (max(line_data$FC, na.rm = TRUE) + min(line_data$FC, na.rm = TRUE)) / 2, fill = category), height = max(line_data$FC, na.rm = TRUE) - min(line_data$FC, na.rm = TRUE), alpha = 0.2) + 
+  geom_line(data = line_data, aes(x = Site, y = FC)) + 
+  theme_bw() +
+  scale_fill_manual(values = c("Neither" = "gray", "Both" = "blue", "Group 1 Only" = "orange", "Group 2 Only" = "green")) +
+  labs(fill = "Region Masked?") + 
+  ylab("Difference in Proportion of Samples with Cleavage") +
+  facet_wrap(~Enzyme)
+```
+
+
+Works as intended, now to explore where they might differ.
+
+
+
+
+
+
+
