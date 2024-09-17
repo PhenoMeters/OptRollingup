@@ -16,20 +16,20 @@ subject_sd = 0.1
 prop_splits_to_miss = 0.1
 missingness_prop = 0.2
 
-n_reps = 30
+n_reps = 10
+out_dat_site_pattern = c()
+out_dat_site = c()
 for(rr in seq_len(n_reps)){
   cat("Replicate", rr, "\n")
   
-  sequences = c(generate_random_protein(1000),
-                generate_random_protein(1000),
-                generate_random_protein(1000))#,
+  sequences = c(generate_random_protein(50),
+                generate_random_protein(50))#,
                 # generate_random_protein(1000),
                 # generate_random_protein(1000))
   
   
   sequence_abundances = rbind(c(1000, 1000),
-                              c(750, 750),
-                              c(1000, 1000))#,
+                              c(750, 750))#,
                               # c(1250, 1250),
                               # c(1000, 1000))
   
@@ -81,7 +81,6 @@ for(rr in seq_len(n_reps)){
   pepdat = pmartR::applyFilt(pmartR::imdanova_filter(pepdat), pepdat, min_nonmiss_anova = 2)
   
   #Site Rollup:
-  out_dat_site = c()
   methods = c('rollup', 'rrollup', 'zrollup')
   combine_fns = c("mean", "median", "sum")
   combinations = expand.grid(method = methods, combine_fn = combine_fns)
@@ -115,7 +114,7 @@ for(rr in seq_len(n_reps)){
   pepdat_sp = pmartR::group_designation(pepdat_sp, main_effects = 'group')
   pepdat_sp = pmartR::applyFilt(pmartR::imdanova_filter(pepdat_sp), pepdat_sp, min_nonmiss_anova = 2)
   
-  out_dat_site_pattern = c()
+
   methods = c('rollup', 'rrollup', 'zrollup')
   combine_fns = c("mean", "median", "sum")
   combinations = expand.grid(method = methods, combine_fn = combine_fns)
@@ -145,15 +144,18 @@ for(rr in seq_len(n_reps)){
           here::here("Results", "ptm_test_sim.RDS"))
 }
 
-ggdat = out_dat_site %>% mutate(SEL = (Fold_change_1_vs_2 - true_fold_change)^2) %>% group_by(replicate, Method, Combine_Function) %>% summarize(SEL = mean(SEL))
+out_list = readRDS(here::here("Results", "ptm_test_sim.RDS"))
+
+
+ggdat = out_list$out_dat_site %>% mutate(SEL = (Fold_change_1_vs_2 - true_fold_change)^2) %>% group_by(replicate, Method, Combine_Function) %>% summarize(SEL = mean(SEL))
 ggplot(ggdat, aes(x = Method, y = SEL, color = Combine_Function)) + 
   geom_boxplot() + 
   ylab("Squared Error Loss of log2FC Recovery") + 
   labs(color = 'Combine Function') + 
-  ggtitle("Site-wise rollup")
-theme_bw()
+  ggtitle("Site-wise rollup") + 
+  theme_bw()
 
-ggdat = out_dat_site_pattern %>% mutate(SEL = (Fold_change_1_vs_2 - true_fold_change)^2) %>% group_by(replicate, Method, Combine_Function) %>% summarize(SEL = mean(SEL))
+ggdat = out_list$out_dat_site_pattern %>% mutate(SEL = (Fold_change_1_vs_2 - true_fold_change)^2) %>% group_by(replicate, Method, Combine_Function) %>% summarize(SEL = mean(SEL))
 ggplot(ggdat, aes(x = Method, y = SEL, color = Combine_Function)) + 
   geom_boxplot() + 
   ylab("Squared Error Loss of log2FC Recovery") + 

@@ -9,6 +9,19 @@ add_char_at_n = function(original_string, new_char, n) {
   return(modified_string)
 }
 
+create_amino_acid_distribution = function(amino_acids){
+  return(table(amino_acids) / length(amino_acids))
+}
+
+generate_protein = function(n, amino_acid_distribution = NULL){
+  if(is.null(amino_acid_distribution)) return(generate_random_protein(n))
+  return(generate_protein_from_distribution(n, amino_acid_distribution))
+}
+
+generate_protein_from_distribution = function(n, amino_acid_distribution){
+  paste(sample(names(amino_acid_distribution), size = n, replace = TRUE, prob = amino_acid_distribution), collapse = '')
+}
+
 generate_random_protein = function(n) {
   amino_acids = c("A", "R", "N", "D", "C", "E", "Q", "G", "H", "I",
                   "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V")
@@ -26,8 +39,7 @@ get_ptm_locations = function(sequence, amino_acid){
   return(stringr::str_locate_all(sequence, amino_acid)[[1]][,1])
 }
 
-get_ptm_site_mapping = function(sequence, amino_acid, drop_na = TRUE){
-  digest_results = Digest(sequence)
+get_ptm_site_mapping = function(sequence, digest_results, amino_acid, drop_na = TRUE){
   ptm_locations = get_ptm_locations(sequence, amino_acid)
   tmp_df = c()
   for(i in seq_along(ptm_locations)){
@@ -66,7 +78,6 @@ ptm_at_sites = function(peptide, sites, identifier, start){
 }
 
 modify_and_count = function(e_meta, modify_indices){
-  # browser()
   peps = unique(e_meta$peptide)
   out_dat = c()
   for(i in seq_along(peps)){
@@ -87,7 +98,7 @@ modify_and_count = function(e_meta, modify_indices){
       curr_ptm = site_modification_counts[j]
       sites = strsplit(names(curr_ptm), split = ';')[[1]]
       ptm = ptm_at_sites(peps[i], sites, "#", pep_e_meta %>% filter(site %in% tmp_site_pattern) %>% pull(start) %>% unique %>% as.numeric())
-      out_dat = rbind(out_dat, tibble(peptide = ptm, site = sites, peptide_count = curr_ptm))
+      out_dat = rbind(out_dat, tibble(peptide = ptm, site = sites, peptide_count = curr_ptm * e_meta$Mult_Factor[i]))
     }
   }
   return(out_dat)
@@ -97,6 +108,7 @@ generate_ptm_samples_for_sequence = function(ptm_site_mapping,
                                              sequence_abundances, 
                                              subject_coefs, 
                                              site_coefs,
+                                             peptide_coef,
                                              group_ids,
                                              prop_to_miss){
   # browser()
@@ -115,10 +127,9 @@ generate_ptm_samples_for_sequence = function(ptm_site_mapping,
     ground_truth_site = cbind(ground_truth_site, colSums(modify_indices))
     
     for(i in seq_len(sum(group_ids == 1))){
-      # TODO: add imperfect digestion here
       
       #modify ptm_site_mapping before passing into modify_and_count
-      ptm_site_mapping_imperfect = imperfect_digest(ptm_site_mapping, prop_to_miss)
+      ptm_site_mapping_imperfect = imperfect_digest(ptm_site_mapping, prop_to_miss, peptide_coef)
       
       e_data = modify_and_count(ptm_site_mapping_imperfect, modify_indices)
       e_meta = e_data %>% rename(true_peptide_count = peptide_count)
@@ -176,8 +187,15 @@ get_samples_for_sequence = function(sequence,
                                     prop_to_miss,
                                     amino_acid = "S", 
                                     identifier = "@"){
-  # browser()
-  ptm_site_mapping = get_ptm_site_mapping(sequence, amino_acid)
+  digest_results = Digest(sequence)
+  
+  peptide_sd = 10
+  unique_peptides = unique(digest_results$peptide)
+  peptide_effects = rnorm(length(unique_peptides), 0, peptide_sd)
+  peptide_effects = peptide_effects - (sum(peptide_effects) / length(unique_peptides)) #ensure they sum to 0
+  names(peptide_effects) = unique_peptides
+  
+  ptm_site_mapping = get_ptm_site_mapping(sequence, digest_results, amino_acid)
   sites = unique(ptm_site_mapping$site) %>% stringi::stri_remove_empty()
   site_coefs = rnorm(length(sites), sd = site_sd)
   names(site_coefs) = sites
@@ -189,6 +207,7 @@ get_samples_for_sequence = function(sequence,
                                           sequence_abundances,
                                           subject_coefs,
                                           site_coefs,
+                                          peptide_coef = peptide_effects,
                                           group_ids = group_ids,
                                           prop_to_miss = prop_to_miss)
   
@@ -280,24 +299,37 @@ assign_plexes = function(omicsData, samples_per_plex, n_plex){
 #   return(digest_data[!remove_vec,])
 # }
 
-imperfect_digest = function(ptm_site_mapping, prop_to_miss){
+imperfect_digest = function(ptm_site_mapping, prop_to_miss, peptide_coef){
+  # browser()
   n_peps = nrow(ptm_site_mapping)
   
-  # TODO does the probability of a sucessful split depend on the peptide length?
+  coef_dat = data.frame(peptide = names(peptide_coef), Mult_Factor = exp(peptide_coef))
+  ptm_site_mapping = ptm_site_mapping %>% left_join(., coef_dat, by = "peptide")
+  
+  # TODO does the probability of a successful split depend on the peptide length?
   ptm_site_mapping = ptm_site_mapping %>% mutate(merge_with_next = (seq_len(n_peps) %in% sample(seq_len(n_peps)[-n_peps], round(prop_to_miss * (n_peps - 1)))))
   protein = ptm_site_mapping$protein %>% unique()
   
   remove_vec = rep(FALSE, nrow(ptm_site_mapping))
+  ptm_site_mapping = ptm_site_mapping %>% as_tibble()
+  
   for(i in seq_len(nrow(ptm_site_mapping) - 1)){
     if(ptm_site_mapping$merge_with_next[i]){
       peptide = paste0(ptm_site_mapping$peptide[i], ptm_site_mapping$peptide[i + 1])
+      mult_factor = ptm_site_mapping$Mult_Factor[i] * ptm_site_mapping$Mult_Factor[i + 1]
       start = ptm_site_mapping$start[i]
       stop = ptm_site_mapping$stop[i + 1]
       remove_vec[i] = TRUE
-      merge_wth_next = ptm_site_mapping$merge_with_next[i+1]
+      merge_with_next = ptm_site_mapping$merge_with_next[i+1]
       site =  paste(ptm_site_mapping$site[i], ptm_site_mapping$site[i + 1], sep = ';')
       
-      ptm_site_mapping[i + 1,] = c(site, peptide, protein, start, stop, merge_wth_next)
+      
+      ptm_site_mapping$peptide[i + 1] = peptide
+      ptm_site_mapping$Mult_Factor[i + 1] = mult_factor
+      ptm_site_mapping$start[i + 1] = start
+      ptm_site_mapping$stop[i + 1] = stop
+      ptm_site_mapping$merge_with_next[i + 1] = merge_with_next
+      ptm_site_mapping$site[i + 1] = site
     }
   }
   return(ptm_site_mapping[!remove_vec,])
