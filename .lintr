@@ -1,0 +1,6 @@
+linters: linters_with_defaults(
+    line_length_linter(Inf),
+    indentation_linter = NULL,
+    object_length_linter(Inf)
+  )
+encoding: "UTF-8"
