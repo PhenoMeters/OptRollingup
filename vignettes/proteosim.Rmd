@@ -1,0 +1,29 @@
+---
+title: "proteosim"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{proteosim}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# LiP Simulation and Evaluation
+
+```{r setup}
+library(proteosim)
+```
+
+```{r}
+
+```

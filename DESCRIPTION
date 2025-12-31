@@ -1,0 +1,20 @@
+Package: proteosim
+Title: An R package for simulating various mass-spectrometry based proteomics datasets with known ground truth. 
+Version: 0.0.0.9000
+Authors@R: 
+    person("Erik", "VonKaenel", , "erik.vonkaenel@pnnl.com", role = c("aut", "cre"),
+           comment = c(ORCID = "0000-0002-8933-7413"))
+Description: What the package does (one paragraph).
+License: MIT + file LICENSE
+Depends: 
+  R (>= 3.0.0)
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
+Imports:
+    magrittr,
+    dplyr
+Suggests: 
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
